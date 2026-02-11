@@ -1,7 +1,7 @@
 /*
 
- Fabry-Perot Scan Asynchronous Data Acquisition using peripherals and timer counter module
- + Feedback Control + Communication with Pi and Dash
+ Fabry-Perot Scan Asynchronous Scope Data Acquisition using peripherals and timer counter module
+ + Feedback Control + Communication with RaspberryPi and by extension Dash server 
 
  By Forest Tschirhart 2/1/2026, 
  foresttschirhart@gmail.com
@@ -32,6 +32,7 @@
 #define RUNNING_BUFFER_SIZE 800     // at 40Hz and 2 samples per scan this is 10 seconds of data
 #define ABS_MIN_DAC_LVL 0           // hard limits on the adjustable vals
 #define ABS_MAX_DAC_LVL 4000
+#define ABS_MAX_DAC_STEP 100
 #define MAX_CMD_ARGS 15             // may change in the future as more params become adjustable
 
 // State variables with corresponding status pins // 
@@ -165,7 +166,7 @@ void setup() {
   pinModeSetup();
   scopeSetup();
   analogWriteResolution(12);
-  analogWrite(MOD_DAC, dac_reset_lvl);//FIX set initial current mod output lvl
+  analogWrite(MOD_DAC, dac_reset_lvl); 
 
   while (!SerialUSB);                   // wait for pi connection before moving to LOOP
   SerialUSB.println("=== Due USB Connected, Loop Starting ===");  
@@ -217,16 +218,22 @@ void loop() {
       short_mem_n_stdev = (float)args[5];
       shortMem = (int)args[6];
       peakfind_thresh = (int)args[7];
-      dac_step = (int)args[8];
+
+      bool step_status = ((int)args[8] <= ABS_MAX_DAC_STEP);
+      if (step_status) {dac_step = (int)args[8];}
 
       // Respond to Pi // 
       SerialUSB.print(start_status);
       SerialUSB.print(",");
       SerialUSB.print(min_status);
       SerialUSB.print(",");
+      SerialUSB.print(step_status);
+      SerialUSB.print(",");
       SerialUSB.print(ABS_MIN_DAC_LVL);
       SerialUSB.print(",");
       SerialUSB.print(ABS_MAX_DAC_LVL);
+      SerialUSB.print(",");
+      SerialUSB.print(ABS_MAX_DAC_STEP);
       SerialUSB.println();
 
     } else if (cmd == 'P') {                        // P for get Params
@@ -275,9 +282,9 @@ void loop() {
       fastDigWrite(MOD_FAILURE, mod_failure_flag);
 
       if ((int)args[0]) {                            // if 0 then don't change output lvl, if 1 then reset the output
-        daclvl = dac_reset_lvl;
+        gentleDacRamp(500, dac_reset_lvl);           
       }
-      analogWrite(MOD_DAC, daclvl);
+      
       bump_count = 0; 
     }
   }
@@ -441,6 +448,25 @@ bool fastDigRead(uint32_t arduinoPin) {
 }
 
 
+// Laser diode can be damaged by high amplitude fast rectangle signals, so this smooths out sudden DAC steps //
+void gentleDacRamp(unsigned int delayus, int final) { 
+  final = constrain(final, 0, 4095);                 // avoid rollovers shocking the diode current
+  int step = final - daclvl;                         
+  int sign;
+  if (step == 0) {
+    return;
+  } else if (step < 0) {
+    sign = -1;
+  } else {
+    sign = 1;
+  }
+  for (int i = 0; i < abs(step); i++) {
+    daclvl += sign;                                  // bump current modulation by +-1
+    analogWrite(MOD_DAC, daclvl);                    // this takes 3.6 us and is negligible compared to ~order 500us explicit delay 
+    delayMicroseconds(delayus);                 
+  }
+}
+
 // ------------------------- MAIN LOOP FUNCS -------------------------- //
 
 // Grab scans from last PDC buffer filled by the asych scope // 
@@ -535,12 +561,8 @@ void feedbackWrapper() {
       mod_failure_flag = true;                                              // blocks entering feedback wrapper again
       mod_active_flag = false;  
 
-    } else if (isPeakLost(short_term_mean, initHeight, short_mem_n_stdev * initStd)) {
-      daclvl -= dac_step;                           // bump current modulation down
-      if (daclvl < 0) {                             // shouldn't be an issue provided the min dac lvl is not negative 
-        daclvl = 0;                                 // but want to avoid rollovers shocking the laser diode current (idk if possible)
-      }
-      analogWrite(MOD_DAC, daclvl);
+    } else if (isPeakLost(short_term_mean, initHeight, short_mem_n_stdev * initStd)) { 
+      gentleDacRamp(500, daclvl - dac_step);        // bump the current down
       bump_count++;
     } else {                                        // thus short term peak height is above stdev
       if (longterm_peakslost_flag) {
